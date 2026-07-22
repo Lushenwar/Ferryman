@@ -1,0 +1,6 @@
+#!/bin/sh
+# Reject commits made directly on main. Branch + PR only.
+if [ "$(git symbolic-ref --short HEAD 2>/dev/null)" = "main" ]; then
+	echo "pre-commit: no direct commits to main. git checkout -b <branch> first." >&2
+	exit 1
+fi
