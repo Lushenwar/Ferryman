@@ -200,12 +200,18 @@ func TestApplyPreservesUnchangedToastValue(t *testing.T) {
 	}
 	meta := tables["public.users"]
 
-	var id int64
+	// Use an explicit id well outside the fixture's range rather than the
+	// sequence: the backfill resets target sequences, so relying on one here
+	// would make this test depend on which other test ran first.
+	const id int64 = 9900001
+	if _, err := conn.Exec(ctx, "DELETE FROM users WHERE id = $1", id); err != nil {
+		t.Fatalf("clear seed row: %v", err)
+	}
 	var originalProfile string
 	err = conn.QueryRow(ctx, `
-		INSERT INTO users (email, profile)
-		VALUES ('toast-before@test', jsonb_build_object('blob', repeat(md5('toast'), 128)))
-		RETURNING id, profile::text`).Scan(&id, &originalProfile)
+		INSERT INTO users (id, email, profile)
+		VALUES ($1, 'toast-before@test', jsonb_build_object('blob', repeat(md5('toast'), 128)))
+		RETURNING profile::text`, id).Scan(&originalProfile)
 	if err != nil {
 		t.Fatalf("seed row: %v", err)
 	}
