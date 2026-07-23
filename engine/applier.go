@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Apply writes one decoded WAL event to the target.
@@ -26,16 +27,55 @@ import (
 // existed at the slot's LSN and is therefore in the snapshot. Phase 3 must
 // preserve that ordering.
 func Apply(ctx context.Context, db Execer, meta TableMeta, e WALEvent) error {
+	_, err := apply(ctx, db, meta, e, time.Time{})
+	return err
+}
+
+// apply reports how many rows the statement touched, which is how a caller
+// running last-write-wins learns that its write lost.
+//
+// lww is the incoming change's commit time, or the zero time to apply
+// unconditionally. See lastWriteWins.
+func apply(ctx context.Context, db Execer, meta TableMeta, e WALEvent, lww time.Time) (int64, error) {
+	var (
+		sql  string
+		vals []any
+		err  error
+	)
 	switch e.Op {
 	case "INSERT":
-		return applyInsert(ctx, db, meta, e)
+		sql, vals, err = buildInsert(meta, e, lww)
 	case "UPDATE":
-		return applyUpdate(ctx, db, meta, e)
+		sql, vals, err = buildUpdate(meta, e, lww)
 	case "DELETE":
-		return applyDelete(ctx, db, meta, e)
+		sql, vals, err = buildDelete(meta, e, lww)
 	default:
-		return fmt.Errorf("unsupported op %q for %s", e.Op, meta.Qualified())
+		return 0, fmt.Errorf("unsupported op %q for %s", e.Op, meta.Qualified())
 	}
+	if err != nil {
+		return 0, err
+	}
+	tag, err := db.Exec(ctx, sql, vals...)
+	if err != nil {
+		return 0, fmt.Errorf("%s %s: %w", strings.ToLower(e.Op), meta.Qualified(), err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// lastWriteWins renders the guard that keeps a replicated change from
+// overwriting a row the receiving database wrote more recently.
+//
+// row is how the existing row is addressed in the statement: bare in an UPDATE
+// or DELETE, table-qualified inside ON CONFLICT DO UPDATE, where an unqualified
+// xmin would be ambiguous.
+//
+// pg_xact_commit_timestamp returns NULL when track_commit_timestamp is off, and
+// for rows old enough to have been frozen. Both are coalesced to -infinity so
+// the replicated write proceeds: skipping it would silently drop data on the
+// strength of an answer we did not get.
+func lastWriteWins(row string, a *args, at time.Time) string {
+	return fmt.Sprintf("coalesce(pg_xact_commit_timestamp(%sxmin), '-infinity') < CAST(%s AS timestamptz)",
+		row, a.next(at))
 }
 
 // args accumulates query parameters and hands out their $n placeholders.
@@ -50,18 +90,7 @@ func (a *args) next(v any) string {
 // otherwise make the generated SQL non-deterministic and untestable.
 func sortedCols(m map[string]any) []string { return slices.Sorted(maps.Keys(m)) }
 
-func applyInsert(ctx context.Context, db Execer, meta TableMeta, e WALEvent) error {
-	sql, vals, err := buildInsert(meta, e)
-	if err != nil {
-		return err
-	}
-	if _, err := db.Exec(ctx, sql, vals...); err != nil {
-		return fmt.Errorf("insert into %s: %w", meta.Qualified(), err)
-	}
-	return nil
-}
-
-func buildInsert(meta TableMeta, e WALEvent) (string, []any, error) {
+func buildInsert(meta TableMeta, e WALEvent, lww time.Time) (string, []any, error) {
 	cols := sortedCols(e.Data)
 	if len(cols) == 0 {
 		return "", nil, fmt.Errorf("insert into %s has no columns", meta.Qualified())
@@ -100,6 +129,9 @@ func buildInsert(meta TableMeta, e WALEvent) (string, []any, error) {
 		} else {
 			fmt.Fprintf(&b, " ON CONFLICT (%s) DO UPDATE SET %s",
 				strings.Join(keys, ", "), strings.Join(sets, ", "))
+			if !lww.IsZero() {
+				fmt.Fprintf(&b, " WHERE %s", lastWriteWins(quoteIdent(meta.Table)+".", &a, lww))
+			}
 		}
 		return b.String(), a.vals, nil
 	}
@@ -116,18 +148,7 @@ func buildInsert(meta TableMeta, e WALEvent) (string, []any, error) {
 	return sql, a.vals, nil
 }
 
-func applyUpdate(ctx context.Context, db Execer, meta TableMeta, e WALEvent) error {
-	sql, vals, err := buildUpdate(meta, e)
-	if err != nil {
-		return err
-	}
-	if _, err := db.Exec(ctx, sql, vals...); err != nil {
-		return fmt.Errorf("update %s: %w", meta.Qualified(), err)
-	}
-	return nil
-}
-
-func buildUpdate(meta TableMeta, e WALEvent) (string, []any, error) {
+func buildUpdate(meta TableMeta, e WALEvent, lww time.Time) (string, []any, error) {
 	var a args
 	var sets []string
 	for _, c := range sortedCols(e.Data) {
@@ -149,26 +170,21 @@ func buildUpdate(meta TableMeta, e WALEvent) (string, []any, error) {
 	if err != nil {
 		return "", nil, err
 	}
+	if !lww.IsZero() {
+		where += " AND " + lastWriteWins("", &a, lww)
+	}
 	return fmt.Sprintf("UPDATE %s SET %s WHERE %s",
 		meta.Qualified(), strings.Join(sets, ", "), where), a.vals, nil
 }
 
-func applyDelete(ctx context.Context, db Execer, meta TableMeta, e WALEvent) error {
-	sql, vals, err := buildDelete(meta, e)
-	if err != nil {
-		return err
-	}
-	if _, err := db.Exec(ctx, sql, vals...); err != nil {
-		return fmt.Errorf("delete from %s: %w", meta.Qualified(), err)
-	}
-	return nil
-}
-
-func buildDelete(meta TableMeta, e WALEvent) (string, []any, error) {
+func buildDelete(meta TableMeta, e WALEvent, lww time.Time) (string, []any, error) {
 	var a args
 	where, err := keyPredicate(meta, identity(e), &a)
 	if err != nil {
 		return "", nil, err
+	}
+	if !lww.IsZero() {
+		where += " AND " + lastWriteWins("", &a, lww)
 	}
 	return fmt.Sprintf("DELETE FROM %s WHERE %s", meta.Qualified(), where), a.vals, nil
 }

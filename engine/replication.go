@@ -43,6 +43,11 @@ type WALEvent struct {
 	// only known once the transaction commits, so it is zero on the event and
 	// filled in by the caller if needed; Stream acks by transaction, not by row.
 	CommitLSN pglogrepl.LSN
+
+	// CommitTime is when the originating transaction committed, taken from the
+	// stream's BEGIN frame. It orders this change against writes made directly
+	// on the receiving database, which is what last-write-wins compares.
+	CommitTime time.Time
 }
 
 // Progress reports how far the applier has durably caught up. Its value is the
@@ -170,6 +175,7 @@ func Stream(ctx context.Context, conn *pgconn.PgConn, slot, publication string, 
 	}
 
 	relations := map[uint32]*pglogrepl.RelationMessage{}
+	var commitTime time.Time // of the transaction currently being decoded
 	acked := startLSN
 	nextStatus := time.Now()
 
@@ -226,6 +232,10 @@ func Stream(ctx context.Context, conn *pgconn.PgConn, slot, publication string, 
 			case *pglogrepl.RelationMessage:
 				relations[m.RelationID] = m
 
+			case *pglogrepl.BeginMessage:
+				// Announced once, up front, ahead of every row it covers.
+				commitTime = m.CommitTime
+
 			case *pglogrepl.CommitMessage:
 				// Every change in this transaction was handled without error,
 				// so the position is now safe to release.
@@ -241,7 +251,7 @@ func Stream(ctx context.Context, conn *pgconn.PgConn, slot, publication string, 
 				data, toast := decodeTuple(rel, m.Tuple)
 				if err := handle(WALEvent{
 					Op: "INSERT", Schema: rel.Namespace, Table: rel.RelationName,
-					Data: data, IsToast: toast,
+					Data: data, IsToast: toast, CommitTime: commitTime,
 				}); err != nil {
 					return err
 				}
@@ -255,7 +265,7 @@ func Stream(ctx context.Context, conn *pgconn.PgConn, slot, publication string, 
 				old, _ := decodeTuple(rel, m.OldTuple)
 				if err := handle(WALEvent{
 					Op: "UPDATE", Schema: rel.Namespace, Table: rel.RelationName,
-					Data: data, OldData: old, IsToast: toast,
+					Data: data, OldData: old, IsToast: toast, CommitTime: commitTime,
 				}); err != nil {
 					return err
 				}
@@ -268,7 +278,7 @@ func Stream(ctx context.Context, conn *pgconn.PgConn, slot, publication string, 
 				old, _ := decodeTuple(rel, m.OldTuple)
 				if err := handle(WALEvent{
 					Op: "DELETE", Schema: rel.Namespace, Table: rel.RelationName,
-					OldData: old,
+					OldData: old, CommitTime: commitTime,
 				}); err != nil {
 					return err
 				}

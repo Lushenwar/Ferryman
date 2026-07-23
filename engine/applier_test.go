@@ -47,7 +47,7 @@ func TestBuildUpdateOmitsUnchangedToastColumn(t *testing.T) {
 		OldData: map[string]any{"id": "1", "email": "old@test"},
 		IsToast: map[string]bool{"profile": true},
 	}
-	sql, vals, err := buildUpdate(usersMeta, e)
+	sql, vals, err := buildUpdate(usersMeta, e, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestBuildUpdateDropsFlaggedColumnEvenWhenPresent(t *testing.T) {
 		OldData: map[string]any{"id": "1"},
 		IsToast: map[string]bool{"profile": true},
 	}
-	sql, _, err := buildUpdate(usersMeta, e)
+	sql, _, err := buildUpdate(usersMeta, e, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestBuildUpdateUsesAllCompositeKeyColumns(t *testing.T) {
 		Data:    map[string]any{"org_id": "7", "user_id": "9", "role": "admin"},
 		OldData: map[string]any{"org_id": "7", "user_id": "9", "role": "member"},
 	}
-	sql, _, err := buildUpdate(membersMeta, e)
+	sql, _, err := buildUpdate(membersMeta, e, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestBuildUpdateUsesAllCompositeKeyColumns(t *testing.T) {
 
 func TestBuildInsertUpsertsOnPrimaryKey(t *testing.T) {
 	e := WALEvent{Op: "INSERT", Data: map[string]any{"id": "1", "email": "a@test", "profile": "{}"}}
-	sql, _, err := buildInsert(usersMeta, e)
+	sql, _, err := buildInsert(usersMeta, e, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestBuildInsertUpsertsOnPrimaryKey(t *testing.T) {
 
 func TestBuildInsertGuardsPKLessTableWithExistenceCheck(t *testing.T) {
 	e := WALEvent{Op: "INSERT", Data: map[string]any{"actor_id": "1", "action": "x"}}
-	sql, _, err := buildInsert(auditMeta, e)
+	sql, _, err := buildInsert(auditMeta, e, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestBuildInsertGuardsPKLessTableWithExistenceCheck(t *testing.T) {
 // Applying anyway would match on the remaining columns and hit unrelated rows.
 func TestKeyPredicateRefusesMissingKeyColumn(t *testing.T) {
 	e := WALEvent{Op: "DELETE", OldData: map[string]any{"email": "a@test"}}
-	if _, _, err := buildDelete(usersMeta, e); err == nil {
+	if _, _, err := buildDelete(usersMeta, e, time.Time{}); err == nil {
 		t.Fatal("expected an error for an event missing its key column")
 	}
 }

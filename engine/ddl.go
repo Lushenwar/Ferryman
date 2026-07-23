@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -166,6 +167,14 @@ type Applier struct {
 	Target DB
 	Source RowQuerier
 
+	// LastWriteWins keeps a replicated change from overwriting a row the target
+	// wrote more recently, and files the losers in the dead-letter table. Set it
+	// through EnableConflictResolution, which checks the target can support it.
+	LastWriteWins bool
+
+	// Conflicts counts changes that lost. Read it after the stream stops.
+	Conflicts int
+
 	tables map[string]TableMeta
 }
 
@@ -193,6 +202,13 @@ func (a *Applier) Handle(ctx context.Context) func(WALEvent) error {
 }
 
 func (a *Applier) apply(ctx context.Context, e WALEvent) error {
+	if e.Table == DLQTable {
+		// Never replicate the dead-letter table. With a FOR ALL TABLES
+		// publication on the reverse pipeline it would otherwise stream into a
+		// database that has no such table, and stall the stream on 42P01.
+		return nil
+	}
+
 	key := e.Schema + "." + e.Table
 	meta, ok := a.tables[key]
 	if !ok {
@@ -207,17 +223,37 @@ func (a *Applier) apply(ctx context.Context, e WALEvent) error {
 		}
 	}
 
-	err := Apply(ctx, a.Target, meta, e)
-	if !isUndefinedColumn(err) {
+	var lww time.Time
+	if a.LastWriteWins {
+		lww = e.CommitTime
+	}
+
+	rows, err := apply(ctx, a.Target, meta, e, lww)
+	if isUndefinedColumn(err) {
+		// The source ran DDL mid-stream. pgoutput does not carry it, but the
+		// event that just failed is itself the notification, and it arrives in
+		// commit order — so reconciling here is exactly early enough.
+		if _, serr := SyncSchema(ctx, a.Source, a.Target); serr != nil {
+			return fmt.Errorf("%w; reconciling the schema failed too: %v", err, serr)
+		}
+		if err := a.reload(ctx); err != nil {
+			return err
+		}
+		rows, err = apply(ctx, a.Target, a.tables[key], e, lww)
+	}
+	if err != nil {
 		return err
 	}
-	if _, serr := SyncSchema(ctx, a.Source, a.Target); serr != nil {
-		return fmt.Errorf("%w; reconciling the schema failed too: %v", err, serr)
+
+	// Only UPDATE and DELETE are counted. A lost INSERT is an upsert whose
+	// existing row was newer, which is the outcome last-write-wins is asking
+	// for, and an ON CONFLICT DO NOTHING affects no rows on every ordinary
+	// replay — neither is a conflict worth filing.
+	if a.LastWriteWins && rows == 0 && (e.Op == "UPDATE" || e.Op == "DELETE") {
+		a.Conflicts++
+		return a.recordConflict(ctx, meta, e)
 	}
-	if err := a.reload(ctx); err != nil {
-		return err
-	}
-	return Apply(ctx, a.Target, a.tables[key], e)
+	return nil
 }
 
 func isUndefinedColumn(err error) bool {
