@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -251,5 +252,133 @@ func TestBackfillAndCDCConverge(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("post-snapshot insert did not arrive over CDC: %d rows", n)
+	}
+}
+
+func TestPageBoundsLeavesNoGapAndNoUpperLimit(t *testing.T) {
+	// Below the split threshold the table stays whole: an extra connection and
+	// snapshot per worker is not worth paying for a handful of pages.
+	if got := pageBounds(minChunkPages-1, 8); len(got) != 1 || got[0] != 0 {
+		t.Errorf("small table split into %v, want one chunk starting at 0", got)
+	}
+	if got := pageBounds(0, 8); len(got) != 1 {
+		t.Errorf("empty table split into %v, want one chunk", got)
+	}
+
+	pages := minChunkPages * 10
+	bounds := pageBounds(pages, 4)
+	if len(bounds) != 4 {
+		t.Fatalf("split into %d chunks, want 4", len(bounds))
+	}
+	// The copy has to start at page zero and every chunk must begin exactly
+	// where the previous one ended, or rows vanish between them.
+	if bounds[0] != 0 {
+		t.Errorf("first chunk starts at page %d, want 0", bounds[0])
+	}
+	for i := 1; i < len(bounds); i++ {
+		if bounds[i] <= bounds[i-1] {
+			t.Errorf("chunk %d starts at %d, not after %d", i, bounds[i], bounds[i-1])
+		}
+	}
+
+	// The last chunk must have no upper bound. relpages is only an estimate, so
+	// a bounded tail drops whatever the heap grew past it — silently.
+	last := chunk{lo: bounds[len(bounds)-1], unbounded: true}
+	if strings.Contains(last.where(), "<") {
+		t.Errorf("final chunk is bounded above: %s", last.where())
+	}
+	if !strings.Contains(chunk{lo: 10, hi: 20}.where(), "ctid < '(20,0)'") {
+		t.Errorf("interior chunk lost its upper bound: %s", chunk{lo: 10, hi: 20}.where())
+	}
+}
+
+// TestChunkedBackfillMatchesSource is the phase 7 exit criterion: a table split
+// across workers must produce exactly what one worker would have.
+func TestChunkedBackfillMatchesSource(t *testing.T) {
+	sourceDSN, targetDSN := dsns(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// The fixture is far smaller than any table worth chunking, so drop the
+	// threshold to make the split happen at all.
+	defer func(n uint32) { minChunkPages = n }(minChunkPages)
+	minChunkPages = 1
+
+	src, err := pgx.Connect(ctx, sourceDSN)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	defer src.Close(context.Background())
+	dst, err := pgx.Connect(ctx, targetDSN)
+	if err != nil {
+		t.Fatalf("connect target: %v", err)
+	}
+	defer dst.Close(context.Background())
+
+	names := []string{"public.users", "public.org_members", "public.audit_log"}
+	meta, err := LoadTables(ctx, src)
+	if err != nil {
+		t.Fatalf("load tables: %v", err)
+	}
+	var metas []TableMeta
+	for _, n := range names {
+		metas = append(metas, meta[n])
+	}
+
+	const parallelism = 4
+	chunks, err := planChunks(ctx, sourceDSN, metas, parallelism)
+	if err != nil {
+		t.Fatalf("plan chunks: %v", err)
+	}
+	if len(chunks) <= len(metas) {
+		t.Fatalf("planned %d chunks for %d tables; nothing was split, so this test proves nothing",
+			len(chunks), len(metas))
+	}
+
+	slot := "ferryman_chunk_slot"
+	_, _ = src.Exec(ctx, "SELECT pg_drop_replication_slot($1)", slot)
+	slotConn, err := ReplicationConnect(ctx, sourceDSN)
+	if err != nil {
+		t.Fatalf("replication connect: %v", err)
+	}
+	defer slotConn.Close(context.Background())
+	snapshot, _, err := EnsureSlot(ctx, slotConn, slot)
+	if err != nil {
+		t.Fatalf("ensure slot: %v", err)
+	}
+	if snapshot == "" {
+		t.Fatal("slot exported no snapshot")
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), sourceDSN)
+		if err != nil {
+			return
+		}
+		defer c.Close(context.Background())
+		_, _ = c.Exec(context.Background(), "SELECT pg_drop_replication_slot($1)", slot)
+	})
+
+	if _, err := dst.Exec(ctx, "TRUNCATE users, org_members, audit_log"); err != nil {
+		t.Fatalf("clear target: %v", err)
+	}
+
+	start := time.Now()
+	if err := Backfill(ctx, sourceDSN, targetDSN, snapshot, metas, parallelism); err != nil {
+		t.Fatalf("chunked backfill: %v", err)
+	}
+	t.Logf("copied %d chunks across %d tables in %s",
+		len(chunks), len(metas), time.Since(start).Round(time.Millisecond))
+
+	// Nothing writes to the source during the test, so the snapshot is the
+	// present: any row missed by a chunk boundary, or copied twice by an
+	// overlapping one, shows up here.
+	for _, name := range names {
+		table := strings.TrimPrefix(name, "public.")
+		sn, ss := checksum(ctx, t, src, table)
+		dn, ds := checksum(ctx, t, dst, table)
+		if sn != dn || ss != ds {
+			t.Errorf("%s does not match after a chunked copy: source %d rows/%s, target %d rows/%s",
+				table, sn, ss, dn, ds)
+		}
 	}
 }

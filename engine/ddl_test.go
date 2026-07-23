@@ -54,12 +54,17 @@ func TestSyncSchemaPropagatesAddedColumnMidStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect source: %v", err)
 	}
-	defer src.Close(context.Background())
 	dst, err := pgx.Connect(ctx, targetDSN)
 	if err != nil {
 		t.Fatalf("connect target: %v", err)
 	}
-	defer dst.Close(context.Background())
+	// Closed via Cleanup rather than defer, and registered first: cleanups run
+	// after the test body and in reverse order, so a deferred close would shut
+	// these connections before the schema below is put back.
+	t.Cleanup(func() {
+		src.Close(context.Background())
+		dst.Close(context.Background())
+	})
 
 	// Both sides start without the column and end without it, so the test is
 	// repeatable and leaves the shared fixture as it found it.
@@ -149,12 +154,17 @@ func TestSyncSchemaRelaxesTargetOnlyNotNullColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect source: %v", err)
 	}
-	defer src.Close(context.Background())
 	dst, err := pgx.Connect(ctx, targetDSN)
 	if err != nil {
 		t.Fatalf("connect target: %v", err)
 	}
-	defer dst.Close(context.Background())
+	// Closed via Cleanup rather than defer, and registered first: cleanups run
+	// after the test body and in reverse order, so a deferred close would shut
+	// these connections before the schema below is put back.
+	t.Cleanup(func() {
+		src.Close(context.Background())
+		dst.Close(context.Background())
+	})
 
 	t.Cleanup(func() {
 		_, _ = dst.Exec(context.Background(), "ALTER TABLE audit_log DROP COLUMN IF EXISTS legacy")
