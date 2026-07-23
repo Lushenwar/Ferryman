@@ -5,6 +5,8 @@
 # Docker users want `docker compose up -d` instead; both produce the same DSNs:
 #   postgres://ferryman:ferryman@127.0.0.1:5433/ferryman   (source)
 #   postgres://ferryman:ferryman@127.0.0.1:5434/ferryman   (target)
+# On WSL, localhost forwarding may not cover these ports; from Windows use the
+# address from `wsl hostname -I` in place of 127.0.0.1.
 set -euo pipefail
 
 VER=16
