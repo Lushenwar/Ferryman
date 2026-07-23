@@ -141,9 +141,9 @@ func TestLastWriteWinsKeepsNewerTargetRow(t *testing.T) {
 		t.Fatalf("new applier: %v", err)
 	}
 	if err := app.EnableConflictResolution(ctx); err != nil {
-		t.Skipf("%v\n\nenable it with:\n"+
-			"  psql -c \"ALTER SYSTEM SET track_commit_timestamp = on\"  # on the target\n"+
-			"  sudo pg_ctlcluster 16 target restart", err)
+		t.Skipf("%v\n\nenable it on the target with:\n"+
+			"  psql -c \"ALTER SYSTEM SET track_commit_timestamp = on\"\n"+
+			"  sudo systemctl restart postgresql@16-target   # or: docker compose restart target_db", err)
 	}
 	t.Cleanup(func() {
 		_, _ = dst.Exec(context.Background(), "DROP TABLE IF EXISTS "+quoteIdent(DLQTable))

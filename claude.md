@@ -28,7 +28,14 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ```
 
 Phase: Complete
-Status: All ten phases implemented and verified against Postgres 16.
+Status: All ten phases implemented and verified against Postgres 16. 23 tests green.
+
+One check is dormant: `TestLastWriteWinsKeepsNewerTargetRow` needs
+`track_commit_timestamp = on` on the target, which is a postmaster setting.
+`ALTER SYSTEM` is already applied; the cluster has not been restarted, so the
+test skips with instructions. Everything else in phase 9 — the read-only
+guardrail, the generated guard, the DLQ — is covered by tests that run.
+
 Update this as you finish each step.
 
 ## WHAT THIS FILE IS
