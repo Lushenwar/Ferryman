@@ -175,6 +175,12 @@ type CutoverConfig struct {
 
 	TargetBackend string        // host:port the router should point at afterwards
 	DrainTimeout  time.Duration // budget for open connections plus replication lag
+
+	// Verify, when non-empty, checks these tables match on both sides before the
+	// switch, and aborts the cutover if they do not. Empty skips the check and
+	// relies on the marker drain alone, which is correct by construction but
+	// proves nothing about earlier phases.
+	Verify []TableMeta
 }
 
 // Cutover moves live traffic from source to target with no refused connections.
@@ -233,6 +239,20 @@ func Cutover(ctx context.Context, cfg CutoverConfig) (err error) {
 	// Strictly past: the marker's own transaction commits after the record.
 	if err := waitForLSN(ctx, cfg.Progress, marker+1); err != nil {
 		return err
+	}
+
+	// Traffic is paused and the stream has drained, so this is the only moment
+	// the two databases are both quiescent and expected to be equal. Verify
+	// opens its own connections, deliberately: the 2s statement timeout above
+	// guards administrative statements, and hashing a large table is not one.
+	if len(cfg.Verify) > 0 {
+		bad, err := Verify(ctx, cfg.SourceDSN, cfg.TargetDSN, cfg.Verify, DefaultVerifyBuckets)
+		if err != nil {
+			return fmt.Errorf("verify before cutover: %w", err)
+		}
+		if len(bad) > 0 {
+			return fmt.Errorf("target diverges from source in %d bucket(s), first: %s", len(bad), bad[0])
+		}
 	}
 
 	// After the drain so it picks up values CDC advanced past, not just the

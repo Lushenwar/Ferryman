@@ -373,7 +373,11 @@ Scope of the reduction: additive column reconciliation, plus dropping `NOT NULL`
 
 **Proposed:** Merkle trees over chunked row hashes, bisecting to isolate diverging rows without moving full tables.
 
-**Verdict — build one Merkle level, not a tree.** A tree's advantage is logarithmic bisection over a slow link; with N chunk hashes on each side the first round already reduces the comparison from rows to hashes and names the diverging page ranges. Building interior nodes to save a second round trip against a database that answers in milliseconds is optimising the wrong resource. `Verify` reuses phase 7's chunker verbatim — same `ctid` bounds on both sides — so a mismatched chunk hands back a `ctid` range to drill into with an ordinary query.
+**Verdict — build one Merkle level, not a tree.** A tree's advantage is logarithmic bisection over a slow link. Here a single `GROUP BY` returns every bucket hash in one round trip per side, so the first round already reduces the comparison from rows to hashes *and* names the diverging buckets. Interior nodes would save round trips that are not being made.
+
+Phase 7's `ctid` chunker is explicitly **not** reused: physical page ranges partition the source's heap, and the target's heap holds the same rows in a completely different physical order, so identical `ctid` bounds would compare unrelated row sets. Buckets are logical instead — `md5` of the row's key columns, mod N — which both sides compute identically and which keeps a modified row in the same bucket on both sides, so a mismatch localises. `md5` rather than `hashtext` because a migration between two Postgres major versions must still agree on the partition.
+
+Comparing text renderings across two clusters also means pinning `TimeZone`, `DateStyle` and `extra_float_digits` on both connections, or identical rows hash differently for reasons that have nothing to do with the data.
 
 Placement matters more than the algorithm: source and target are *never* equal while CDC is live, because lag is not a defect. The only sound moment to compare is inside the cutover, after the marker drain and before the router repoints — traffic paused, both databases quiescent. `CutoverConfig.Verify` runs it there and aborts the cutover on mismatch, resuming traffic against the source.
 
