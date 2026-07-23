@@ -3,7 +3,8 @@ package engine
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -47,14 +48,7 @@ func (a *args) next(v any) string {
 
 // sortedCols gives statements a stable column order. Map iteration order would
 // otherwise make the generated SQL non-deterministic and untestable.
-func sortedCols(m map[string]any) []string {
-	cols := make([]string, 0, len(m))
-	for c := range m {
-		cols = append(cols, c)
-	}
-	sort.Strings(cols)
-	return cols
-}
+func sortedCols(m map[string]any) []string { return slices.Sorted(maps.Keys(m)) }
 
 func applyInsert(ctx context.Context, db Execer, meta TableMeta, e WALEvent) error {
 	sql, vals, err := buildInsert(meta, e)
