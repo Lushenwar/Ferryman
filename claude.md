@@ -10,12 +10,12 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ```
 
 ╔══════════════════════════════════════════════════════════╗
-║  BUILD PROGRESS                                 3/6 DONE ║
-║  ███████████████░░░░░░░░░░░░░  IN DEVELOPMENT            ║
+║  BUILD PROGRESS                                 4/6 DONE ║
+║  ███████████████████░░░░░░░░░  IN DEVELOPMENT            ║
 ║  Phase 0: Base Sync & Dual-Schema Setup         [DONE]   ║
 ║  Phase 1: Logical Replication & WAL Decoder     [DONE]   ║
 ║  Phase 2: Idempotent Applier & TOAST Handler    [DONE]   ║
-║  Phase 3: Exported Snapshot Backfill Engine     [TODO]   ║
+║  Phase 3: Exported Snapshot Backfill Engine     [DONE]   ║
 ║  Phase 4: Cutover Router & Connection Switcher  [TODO]   ║
 ║  Phase 5: Fail-Safe Execution & Reverse CDC     [TODO]   ║
 ╚══════════════════════════════════════════════════════════╝
