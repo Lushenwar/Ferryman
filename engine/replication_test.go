@@ -124,7 +124,7 @@ func TestStreamDecodesRowChanges(t *testing.T) {
 	defer stop()
 
 	var got []WALEvent
-	err = Stream(streamCtx, slotConn, slot, pub, consistent, func(e WALEvent) error {
+	err = Stream(streamCtx, slotConn, slot, pub, consistent, nil, func(e WALEvent) error {
 		if e.Table != "users" {
 			return nil // the fixture may have other traffic; ignore it
 		}

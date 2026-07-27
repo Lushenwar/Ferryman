@@ -199,7 +199,7 @@ func TestBackfillAndCDCConverge(t *testing.T) {
 
 	streamErr := make(chan error, 1)
 	go func() {
-		streamErr <- Stream(streamCtx, slotConn, slot, pub, consistent, func(e WALEvent) error {
+		streamErr <- Stream(streamCtx, slotConn, slot, pub, consistent, nil, func(e WALEvent) error {
 			m, ok := meta[e.Schema+"."+e.Table]
 			if !ok {
 				return nil

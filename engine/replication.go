@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -42,6 +43,28 @@ type WALEvent struct {
 	// only known once the transaction commits, so it is zero on the event and
 	// filled in by the caller if needed; Stream acks by transaction, not by row.
 	CommitLSN pglogrepl.LSN
+}
+
+// Progress reports how far the applier has durably caught up. Its value is the
+// end LSN of the most recent transaction applied without error, so it is a
+// statement about the target, not about what has merely been received.
+//
+// The zero value is ready to use, and a nil *Progress is accepted everywhere,
+// which keeps it optional for callers that do not measure lag.
+type Progress struct{ v atomic.Uint64 }
+
+func (p *Progress) set(lsn pglogrepl.LSN) {
+	if p != nil {
+		p.v.Store(uint64(lsn))
+	}
+}
+
+// LSN is safe to call from another goroutine while a stream is running.
+func (p *Progress) LSN() pglogrepl.LSN {
+	if p == nil {
+		return 0
+	}
+	return pglogrepl.LSN(p.v.Load())
 }
 
 // ReplicationConnect opens a connection in walsender mode. A normal connection
@@ -127,12 +150,19 @@ func SlotLSN(ctx context.Context, conn *pgconn.PgConn, slot string) (pglogrepl.L
 // returns an error, Stream stops without acknowledging, and the next run
 // redelivers from the last committed position.
 //
-// Passing startLSN 0 resumes from the slot's own confirmed position.
-func Stream(ctx context.Context, conn *pgconn.PgConn, slot, publication string, startLSN pglogrepl.LSN, handle func(WALEvent) error) error {
+// Passing startLSN 0 resumes from the slot's own confirmed position. progress
+// may be nil; when set, it tracks how far the target has caught up, which is
+// what cutover waits on to reach zero lag.
+func Stream(ctx context.Context, conn *pgconn.PgConn, slot, publication string, startLSN pglogrepl.LSN, progress *Progress, handle func(WALEvent) error) error {
 	err := pglogrepl.StartReplication(ctx, conn, slot, startLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{
 			"proto_version '1'",
 			"publication_names '" + publication + "'",
+			// Cutover drains lag by dropping a logical decoding message into the
+			// stream and waiting to pass it. Without this option pgoutput drops
+			// the message, the transaction is empty, and pgoutput suppresses
+			// empty transactions — so the marker would never arrive.
+			"messages 'true'",
 		},
 	})
 	if err != nil {
@@ -200,6 +230,7 @@ func Stream(ctx context.Context, conn *pgconn.PgConn, slot, publication string, 
 				// Every change in this transaction was handled without error,
 				// so the position is now safe to release.
 				acked = m.TransactionEndLSN
+				progress.set(acked)
 				nextStatus = time.Now()
 
 			case *pglogrepl.InsertMessage:
