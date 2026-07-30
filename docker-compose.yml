@@ -5,12 +5,29 @@ services:
       POSTGRES_PASSWORD: ferryman
       POSTGRES_DB: ferryman
     ports: ["5433:5432"]
+    # track_commit_timestamp is a postmaster setting, so it has to be here rather
+    # than an ALTER SYSTEM: without it the applier cannot order a replicated
+    # change against a local one and last-write-wins is unavailable. Both sides
+    # get it because each is the receiving side in one direction.
     command: >
       postgres -c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8
+               -c track_commit_timestamp=on
     volumes:
       - ./sql:/sql:ro
       - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ./sql/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    # -h forces TCP, and that is the whole point. During initdb the entrypoint
+    # runs a temporary server that listens on the unix socket only, so a socket
+    # pg_isready reports ready while the schema and seed are still loading and the
+    # real TCP listener does not exist yet — `--wait` then returns and the tests
+    # connect to nothing. Over TCP the check stays red until the actual server is
+    # accepting, which is what callers mean by ready.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d ferryman"]
+      interval: 2s
+      timeout: 3s
+      # Generous because the source seeds 250k rows before the real server starts.
+      retries: 90
 
   target_db:
     image: postgres:16
@@ -21,6 +38,19 @@ services:
     # ponytail: target also runs wal_level=logical so phase 5 reverse CDC needs no restart
     command: >
       postgres -c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8
+               -c track_commit_timestamp=on
     volumes:
       - ./sql:/sql:ro
       - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    # -h forces TCP, and that is the whole point. During initdb the entrypoint
+    # runs a temporary server that listens on the unix socket only, so a socket
+    # pg_isready reports ready while the schema and seed are still loading and the
+    # real TCP listener does not exist yet — `--wait` then returns and the tests
+    # connect to nothing. Over TCP the check stays red until the actual server is
+    # accepting, which is what callers mean by ready.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d ferryman"]
+      interval: 2s
+      timeout: 3s
+      # Generous because the source seeds 250k rows before the real server starts.
+      retries: 90

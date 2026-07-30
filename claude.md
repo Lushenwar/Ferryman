@@ -10,8 +10,7 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ```
 
 ╔══════════════════════════════════════════════════════════╗
-║  BUILD PROGRESS                              10/10 DONE  ║
-║  ██████████████████████████████  ALL PHASES COMPLETE     ║
+║  ENGINE COMPONENTS                           10/10 DONE  ║
 ║  Phase 0: Base Sync & Dual-Schema Setup         [DONE]   ║
 ║  Phase 1: Logical Replication & WAL Decoder     [DONE]   ║
 ║  Phase 2: Idempotent Applier & TOAST Handler    [DONE]   ║
@@ -23,18 +22,44 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ║  Phase 7: Chunked Parallel Backfill             [DONE]   ║
 ║  Phase 8: Row-Level Consistency Auditor         [DONE]   ║
 ║  Phase 9: Conflict Resolution & DLQ             [DONE]   ║
+║  ── orchestration ──────────────────────────────────     ║
+║  cmd/ferryman: CLI sequencing the whole run     [DONE]   ║
+║  README + CI running the integration suite      [DONE]   ║
+║  Transaction-scoped apply (per-row today)       [TODO]   ║
+║  Transformation layer, or renamed pitch         [OPEN]   ║
 ╚══════════════════════════════════════════════════════════╝
 
 ```
 
-Phase: Complete
-Status: All ten phases implemented and verified against Postgres 16. 23 tests green.
+Status: the engine primitives are complete and `cmd/ferryman` is the caller that
+sequences them, enforcing in code the three orderings that were previously only
+documented (slot session open across the backfill; no CDC apply before the
+backfill returns; reverse slot created before cutover).
 
-One check is dormant: `TestLastWriteWinsKeepsNewerTargetRow` needs
-`track_commit_timestamp = on` on the target, which is a postmaster setting.
-`ALTER SYSTEM` is already applied; the cluster has not been restarted, so the
-test skips with instructions. Everything else in phase 9 — the read-only
-guardrail, the generated guard, the DLQ — is covered by tests that run.
+Two things are deliberately still open, and both are recorded in the README's
+Known limits rather than hidden:
+
+  - **Apply is per row, not per transaction.** Each change is its own autocommit
+    statement, so the target does not observe source transactions atomically
+    during sync, and throughput is one round trip per row — a source sustaining
+    more writes than that will outrun the applier and lag will grow without
+    bound. Batching between `BeginMessage` and `CommitMessage` into one `pgx.Tx`
+    fixes atomicity and throughput together, and aligns apply granularity with
+    the ack granularity `Stream` already uses. The complication is that DDL
+    recovery (phase 6) runs `SyncSchema` and retries *after* a failed statement,
+    which inside a transaction has already aborted everything — so the buffered
+    transaction has to be rolled back, reconciled, and replayed whole.
+  - **There is no transformation layer.** Backfill copies an identical column
+    list both ways and the applier writes source column names straight to the
+    target, so this moves a database rather than reshaping one. Either build
+    column/type mapping, or keep the pitch as "cutover orchestrator", which is
+    what the README currently says.
+
+Verification: `make test` brings up both instances, sets both DSNs and runs
+everything; CI does the same and fails if any test skips, because without DSNs
+the integration tests skip themselves and `go test ./...` still prints `ok`.
+`track_commit_timestamp = on` is now set in `docker-compose.yml` for both
+instances, so the last-write-wins check runs rather than skipping.
 
 Update this as you finish each step.
 
@@ -46,7 +71,9 @@ This document is the authoritative technical specification for building the Zero
 
 ## PRODUCT DEFINITION
 
-The Zero-Downtime Migration Orchestrator is a lightweight, low-latency data migration engine designed to perform schema migrations between Postgres instances without taking the application offline. It combines **exported snapshot backfilling** with **Change Data Capture (CDC)** via Postgres Logical Replication (`pgoutput`) to keep a target database in sync with a source database before executing an atomic cutover with optional reverse replication.
+The Zero-Downtime Migration Orchestrator is a lightweight, low-latency data migration engine designed to move a live database between Postgres instances without taking the application offline. It combines **exported snapshot backfilling** with **Change Data Capture (CDC)** via Postgres Logical Replication (`pgoutput`) to keep a target database in sync with a source database before executing an atomic cutover with optional reverse replication.
+
+The original framing of this document said "schema migrations". That is not what got built and the wording is corrected here deliberately: there is no transformation layer, so the target schema must match the source. Carrying a schema *change* across works the ordinary way — run the `ALTER TABLE` on the source and phase 6 reconciles the target — but reshaping one schema into a different one is out of scope until the mapping layer exists.
 
 ### What the Orchestrator IS:
 * A specialized migration agent that streams and decodes Postgres Write-Ahead Logs (WAL) using native `pgoutput` messages via `github.com/jackc/pglogrepl`.
@@ -56,6 +83,7 @@ The Zero-Downtime Migration Orchestrator is a lightweight, low-latency data migr
 
 ### What the Orchestrator IS NOT:
 * Not a general-purpose ETL framework or Debezium clone. It does not support arbitrary non-Postgres sinks.
+* Not a schema-transformation tool. Column names and types are carried across unchanged — no renames, type conversions, table splits or merges, or computed defaults.
 * Not an active-active multi-master replication tool. Replication is strictly unidirectional per phase (`Source -> Target` during sync, `Target -> Source` during rollback window).
 * Not a loose script. It must handle connection drops, LSN tracking, keepalives, and crash-recovery restarts.
 
