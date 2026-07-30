@@ -1,4 +1,6 @@
-ferryman
-ferryman.exe
+# Anchored to the repo root: an unanchored "ferryman" also matches the
+# cmd/ferryman/ directory, which silently excludes the entrypoint from commits.
+/ferryman
+/ferryman.exe
 *.exe
 .env
