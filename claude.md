@@ -25,7 +25,7 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ║  ── orchestration ──────────────────────────────────     ║
 ║  cmd/ferryman: CLI sequencing the whole run     [DONE]   ║
 ║  README + CI running the integration suite      [DONE]   ║
-║  Transaction-scoped apply (per-row today)       [TODO]   ║
+║  Phase 10: Transaction-scoped apply      [DESIGNED]      ║
 ║  Transformation layer, or renamed pitch         [OPEN]   ║
 ╚══════════════════════════════════════════════════════════╝
 
@@ -47,8 +47,8 @@ Known limits rather than hidden:
     fixes atomicity and throughput together, and aligns apply granularity with
     the ack granularity `Stream` already uses. The complication is that DDL
     recovery (phase 6) runs `SyncSchema` and retries *after* a failed statement,
-    which inside a transaction has already aborted everything — so the buffered
-    transaction has to be rolled back, reconciled, and replayed whole.
+    which inside a transaction has already aborted everything. **Designed in full
+    under PHASE 10 at the end of this file — read that before writing any of it.**
   - **There is no transformation layer.** Backfill copies an identical column
     list both ways and the applier writes source column names straight to the
     target, so this moves a database rather than reshaping one. Either build
@@ -435,3 +435,81 @@ The DLQ is a table and an insert. The admin review endpoint is an HTTP server, a
 **Exit Criterion:** with `track_commit_timestamp` on, a source-side write newer than a replicated one survives the replay and is recorded as a conflict; `SetReadOnly` rejects the stray write outright.
 
 ```
+---
+
+## PHASE 10 (DESIGNED, NOT BUILT): TRANSACTION-SCOPED APPLY
+
+**Problem:** the applier runs one autocommit statement per row change. Two
+consequences, both real. *Correctness:* the target never observes a source
+transaction atomically — a transfer that debits A and credits B lands as two
+independent commits, so anything reading the target mid-sync (a shadow-read
+verifier, most obviously) can see a state the source never had. *Throughput:*
+one network round trip per row, serialised. A source sustaining a few thousand
+writes/sec outruns the applier permanently, lag grows without bound, and the
+cutover drain never converges.
+
+**Shape of the fix:** open one `pgx.Tx` per source transaction and commit it at
+`CommitMessage`. This aligns apply granularity with the ack granularity `Stream`
+already uses — it only reports a position at transaction boundaries — so the two
+stop disagreeing.
+
+### The collision with DDL recovery, and how it resolves
+
+Phase 6 recovers from mid-stream DDL by catching 42703, running `SyncSchema`,
+and retrying. That does not survive being wrapped in a transaction: a failed
+statement aborts the whole transaction, so every subsequent statement — including
+the DDL and the retry — fails with 25P02 until someone rolls back. The recovery
+mechanism and the batching mechanism are in direct conflict, which is why this
+was left alone rather than rushed.
+
+It resolves in two parts.
+
+**1. Reconcile on `RelationMessage`, before the transaction opens.** This is the
+mechanism phase 6's own rationale already identified but did not use: pgoutput
+emits a fresh `RelationMessage` before the first DML on a changed relation. It
+therefore arrives *ahead of* the statement that would fail, and the applier can
+diff its column list against the cached target metadata and reconcile there. To
+make that land outside the transaction, the transaction must be opened lazily —
+at the first row change, not at `BeginMessage` — because pgoutput's frame order
+within a transaction is `BEGIN`, `RELATION`, then the row changes. Reconciling
+when the `RELATION` frame arrives happens after `BEGIN` but before the first
+statement, which is exactly the window needed.
+
+This removes the mid-transaction failure for every additive case, which is the
+case phase 6 exists for.
+
+**2. On any error inside the transaction, roll back and let the slot redeliver.**
+For whatever `RelationMessage` cannot predict — a type change, target-side drift,
+a transient failure — roll back and return the error without acking. `Stream`
+already guarantees the consequence: it reports a position only after a whole
+transaction succeeded, so an un-acked transaction is redelivered in full from the
+slot on the next run.
+
+**Answering the question directly: the retry replays the whole source
+transaction, not the failed statement.** It has to. The rollback undid the
+statements that had already succeeded in that transaction, so resuming at the
+failed statement would silently skip them. Replaying the whole transaction is
+safe because every statement the applier generates is already idempotent by
+construction — inserts upsert, updates rewrite the same values, deletes of an
+absent row affect nothing — which is the property phase 2 was built for and which
+is now load-bearing for a second reason.
+
+**No in-memory buffer.** The obvious implementation retains the transaction's
+events in memory so it can replay them without going back to Postgres, and that
+is worth *not* doing: a bulk `UPDATE` of ten million rows is one source
+transaction, so the buffer is unbounded and needs a cap, a spill path, and a
+fallback mode. The slot is already a durable buffer holding exactly these events,
+and replaying from it costs one stream restart on an event that is rare by
+definition. The caller needs a retry loop around `Stream`; that is the whole
+cost, and `cmd/ferryman` needs one regardless for ordinary connection drops.
+
+**ponytail:** the savepoint-per-statement alternative — `SAVEPOINT` before each
+row so a failure rolls back one statement instead of the transaction — is
+rejected. It restores single-statement retry, but at the price of a round trip
+per row, which is the exact cost this phase exists to remove.
+
+**Exit Criterion:** a source transaction touching several rows is visible on the
+target all at once or not at all; applied throughput on a write-heavy source is
+bounded by batch size rather than by round trips; and
+`TestSyncSchemaPropagatesAddedColumnMidStream` still passes, now via the
+`RelationMessage` path rather than the 42703 path.

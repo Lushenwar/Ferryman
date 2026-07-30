@@ -4,3 +4,5 @@
 /ferryman.exe
 *.exe
 .env
+# CI tees the test output here so it can count skips from the same run.
+/test.log
