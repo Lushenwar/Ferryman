@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go build ./...
+      - run: go vet ./...
+
+      # Compose rather than service containers: the schema and seed are mounted
+      # into docker-entrypoint-initdb.d, and both instances need postmaster flags
+      # (wal_level, track_commit_timestamp) that service containers cannot set.
+      # --wait blocks on the healthchecks, so the tests never race the initdb.
+      - name: start both postgres instances
+        run: docker compose up -d --wait
+
+      # Without the DSNs the integration tests skip themselves and the job still
+      # passes, which is the whole reason this file exists. The skip count is
+      # checked from the same run rather than a second one: a skip here means a
+      # test quietly stopped covering anything.
+      - name: test
+        env:
+          FERRYMAN_SOURCE_DSN: postgres://postgres:ferryman@127.0.0.1:5433/ferryman
+          FERRYMAN_TARGET_DSN: postgres://postgres:ferryman@127.0.0.1:5434/ferryman
+        run: |
+          set -o pipefail
+          go test ./... -count=1 -v | tee test.log
+          echo "skipped: $(grep -c '^--- SKIP' test.log || true)"
+          test "$(grep -c '^--- SKIP' test.log || true)" -eq 0
+
+      - name: postgres logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
