@@ -16,11 +16,18 @@ services:
       - ./sql:/sql:ro
       - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ./sql/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    # -h forces TCP, and that is the whole point. During initdb the entrypoint
+    # runs a temporary server that listens on the unix socket only, so a socket
+    # pg_isready reports ready while the schema and seed are still loading and the
+    # real TCP listener does not exist yet — `--wait` then returns and the tests
+    # connect to nothing. Over TCP the check stays red until the actual server is
+    # accepting, which is what callers mean by ready.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ferryman"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d ferryman"]
       interval: 2s
       timeout: 3s
-      retries: 30
+      # Generous because the source seeds 250k rows before the real server starts.
+      retries: 90
 
   target_db:
     image: postgres:16
@@ -35,8 +42,15 @@ services:
     volumes:
       - ./sql:/sql:ro
       - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    # -h forces TCP, and that is the whole point. During initdb the entrypoint
+    # runs a temporary server that listens on the unix socket only, so a socket
+    # pg_isready reports ready while the schema and seed are still loading and the
+    # real TCP listener does not exist yet — `--wait` then returns and the tests
+    # connect to nothing. Over TCP the check stays red until the actual server is
+    # accepting, which is what callers mean by ready.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ferryman"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d ferryman"]
       interval: 2s
       timeout: 3s
-      retries: 30
+      # Generous because the source seeds 250k rows before the real server starts.
+      retries: 90
