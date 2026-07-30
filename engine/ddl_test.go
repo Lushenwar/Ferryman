@@ -58,12 +58,21 @@ func TestSyncSchemaPropagatesAddedColumnMidStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect target: %v", err)
 	}
+	// A separate connection for the assertions below. dst belongs to the applier
+	// once the stream goroutine starts, and a *pgx.Conn carries one statement at a
+	// time: polling on the same connection races the applier and fails with
+	// "conn busy" whenever the poll lands mid-statement.
+	probe, err := pgx.Connect(ctx, targetDSN)
+	if err != nil {
+		t.Fatalf("connect target to probe: %v", err)
+	}
 	// Closed via Cleanup rather than defer, and registered first: cleanups run
 	// after the test body and in reverse order, so a deferred close would shut
 	// these connections before the schema below is put back.
 	t.Cleanup(func() {
 		src.Close(context.Background())
 		dst.Close(context.Background())
+		probe.Close(context.Background())
 	})
 
 	// Both sides start without the column and end without it, so the test is
@@ -133,7 +142,7 @@ func TestSyncSchemaPropagatesAddedColumnMidStream(t *testing.T) {
 			t.Fatalf("stream stopped instead of reconciling the schema: %v", err)
 		default:
 		}
-		return dst.QueryRow(ctx, "SELECT nickname FROM users WHERE id = $1", id).Scan(&nickname) == nil
+		return probe.QueryRow(ctx, "SELECT nickname FROM users WHERE id = $1", id).Scan(&nickname) == nil
 	})
 	if nickname == nil || *nickname != "ferry" {
 		t.Errorf("nickname on the target is %v, want \"ferry\"; the column was added but the "+
