@@ -25,7 +25,7 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ║  ── orchestration ──────────────────────────────────     ║
 ║  cmd/ferryman: CLI sequencing the whole run     [DONE]   ║
 ║  README + CI running the integration suite      [DONE]   ║
-║  Transaction-scoped apply (per-row today)       [TODO]   ║
+║  Phase 10: Transaction-scoped apply      [DESIGNED]      ║
 ║  Transformation layer, or renamed pitch         [OPEN]   ║
 ╚══════════════════════════════════════════════════════════╝
 
@@ -47,8 +47,8 @@ Known limits rather than hidden:
     fixes atomicity and throughput together, and aligns apply granularity with
     the ack granularity `Stream` already uses. The complication is that DDL
     recovery (phase 6) runs `SyncSchema` and retries *after* a failed statement,
-    which inside a transaction has already aborted everything — so the buffered
-    transaction has to be rolled back, reconciled, and replayed whole.
+    which inside a transaction has already aborted everything. **Designed in full
+    under PHASE 10 at the end of this file — read that before writing any of it.**
   - **There is no transformation layer.** Backfill copies an identical column
     list both ways and the applier writes source column names straight to the
     target, so this moves a database rather than reshaping one. Either build
